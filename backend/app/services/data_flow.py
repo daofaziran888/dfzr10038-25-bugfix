@@ -6,11 +6,16 @@
 from __future__ import annotations
 
 import datetime
-import math
 import random
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.services.sample_count import (
+    SAMPLE_LOCK,
+    dispatchable_details,
+    parse_sample_count,
+    refresh_validation,
+)
 from app.store import store
 
 # ---------------------------------------------------------------------------
@@ -370,66 +375,193 @@ def flow_version_to_online(version_mgr_id: int) -> list[FlowEffect]:
 
 
 @_register(
-    "sample_strata/已出样 → label_task/派发任务 → label_review/确认通过 → consent_calc/启动计算",
+    "sample_strata/确认出样 → label_task/派发任务 → label_review/确认通过 → consent_calc/启动计算",
     desc="样本确认出样后派发标注任务，审核通过后自动触发一致性计算。",
 )
 def flow_sample_to_label_to_review_to_consent(sample_strata_id: int) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
-    ss = store.find("sample_strata", sample_strata_id)
-    if ss is None or ss.get("status") != "已出样":
-        return effects
+    with SAMPLE_LOCK:
+        ss = store.find("sample_strata", sample_strata_id)
+        if ss is None or ss.get("status") != "已出样":
+            return effects
 
-    strategy_no = str(ss.get("策略编号", ""))
-    sample_count = int(ss.get("样本数量", 10))
+        # 确认出样时必须已经落库一份校验明细；历史记录在这里补齐。
+        detail = ss.get("当前校验明细")
+        if detail is None:
+            detail = refresh_validation(ss, action="确认出样")
 
-    # 标注派发
-    label_task = _dispatch_label_task(strategy_no, sample_count, effects)
+        if ss.get("派发已接受"):
+            # 已经派发过的策略再次确认（含并发重试）不再消费任务；
+            # 但联动轨迹仍要能复查已经发生的派发。
+            return _replay_effects(ss)
 
-    if label_task is None:
-        return effects
+        sample_count = detail.get("有效样本数量")
+        if not detail.get("可派发") or sample_count is None:
+            # 出样校验明细仍为“暂无可用数量”：待补录，不占用空闲派发任务。
+            return effects
 
-    # 模拟标注完成 → 审核通过
-    _label_review_pass(label_task, effects)
-    # 审核通过 → 一致性计算
-    _consent_calc_trigger(label_task, effects)
+        strategy_no = str(detail.get("原策略编号") or ss.get("策略编号") or "")
 
+        # 标注派发只消费校验明细中的有效范围，并且同一策略只派发一次。
+        label_task = _dispatch_label_task(strategy_no, int(sample_count), effects)
+
+        if label_task is None:
+            return effects
+
+        # 记录在本策略上的派发凭据，供并发确认和派发清单复查。
+        ss["派发已接受"] = True
+        ss["派发任务编号"] = label_task.get("任务编号", "")
+        ss["派发任务id"] = label_task.get("id")
+        ss["派发原因"] = f"出样校验通过，已接受派发任务 {label_task.get('任务编号','')}"
+        if ss.get("当前校验明细"):
+            ss["当前校验明细"]["派发已接受"] = True
+            ss["当前校验明细"]["已接受"] = True
+            ss["当前校验明细"]["任务编号"] = label_task.get("任务编号", "")
+            ss["当前校验明细"]["原因"] = ss["派发原因"]
+        # 派发清单直接读取分层记录上的校验明细，接受状态随明细一起同步。
+
+        # 模拟标注完成 → 审核通过
+        _label_review_pass(label_task, effects)
+        # 审核通过 → 一致性计算
+        _consent_calc_trigger(label_task, effects)
+
+    return effects
+
+
+def _replay_effects(ss: dict[str, Any]) -> list[FlowEffect]:
+    """已派发策略的轨迹：回放既有派发/审核/计算副作用，不修改任何状态。"""
+    task_no = str(ss.get("派发任务编号") or "")
+    strategy_no = str(ss.get("原策略编号") or ss.get("策略编号") or "")
+    if not task_no:
+        return []
+    effects = [FlowEffect(
+        "派发任务", "label_task", int(ss.get("派发任务id") or 0),
+        f"样本 {strategy_no}({ss.get('有效样本数量')}条) 出样后派发标注任务 {task_no}",
+    )]
+    for rrow in store.rows("label_review"):
+        if str(rrow.get("标注任务") or "") == task_no and rrow.get("status") == "已通过":
+            effects.append(FlowEffect(
+                "确认通过", "label_review", int(rrow.get("id", 0)),
+                f"标注 {task_no} 审核通过，一致率 {rrow.get('一致率','')}，触发一致性计算",
+            ))
+            break
+    for crow in store.rows("consent_calc"):
+        if str(crow.get("标注任务") or "") == task_no:
+            effects.append(FlowEffect(
+                "启动计算", "consent_calc", int(crow.get("id", 0)),
+                f"审核 {task_no} 通过后计算一致性，Kappa={crow.get('Kappa系数','')}",
+            ))
+            break
     return effects
 
 
 def _dispatch_label_task(
     strategy_no: str, sample_count: int, effects: list[FlowEffect]
 ) -> dict[str, Any] | None:
-    """派发标注任务。"""
+    """从出样校验明细派发标注任务；同一策略并发确认只产生一条有效任务。"""
+    if parse_sample_count(sample_count)[0] is None:
+        return None
+
+    # 只消费派发清单里的有效范围：待补录的策略即使误入这里也不会占用任务。
+    in_range = any(
+        str(detail.get("原策略编号") or detail.get("策略编号") or "") == strategy_no
+        and detail.get("可派发")
+        for detail in dispatchable_details()
+    )
+    if not in_range:
+        return None
+
     label_rows = store.rows("label_task")
+
+    # 幂等：该策略已派发过时直接返回空，不再消耗新的空闲任务。
     for lrow in label_rows:
-        if lrow.get("status") == "待派发":
+        if (
+            str(lrow.get("原策略编号") or "") == strategy_no
+            and str(lrow.get("触发策略") or "") == strategy_no
+            and lrow.get("status") in ("标注中", "已完成")
+        ):
+            return None
+
+    for lrow in label_rows:
+        if lrow.get("status") == "待派发" and not (
+            lrow.get("原策略编号") or lrow.get("触发策略")
+        ):
+            task_no = str(lrow.get("任务编号", ""))
             lrow["status"] = "标注中"
             lrow["pending"] = True
+            lrow["原策略编号"] = strategy_no
+            lrow["触发策略"] = strategy_no
             lrow["样本范围"] = f"样本{strategy_no}"
-            lrow["完成进度"] = "100%"
+            lrow["样本数量"] = sample_count
+            lrow["有效样本数量"] = sample_count
+            lrow["完成进度"] = "0%"
             lrow["派发时间"] = datetime.datetime.now().isoformat()
             lrow["triggered_by"] = f"sample_strata/{strategy_no}"
             effects.append(FlowEffect(
                 "派发任务", "label_task", int(lrow.get("id", 0)),
-                f"样本 {strategy_no}({sample_count}条) 出样后派发标注任务 {lrow.get('任务编号','')}",
+                f"样本 {strategy_no}({sample_count}条) 出样后派发标注任务 {task_no}",
             ))
             return lrow
-    return None
+
+    # 没有空闲任务时按现有编号顺延新增一条，派发清单的有效范围仍只会被消费一次。
+    return _create_label_task(strategy_no, sample_count, effects)
+
+
+def _create_label_task(
+    strategy_no: str, sample_count: int, effects: list[FlowEffect]
+) -> dict[str, Any] | None:
+    label_rows = store.rows("label_task")
+    numbers = []
+    for row in label_rows:
+        text = str(row.get("任务编号", ""))
+        suffix = text.rsplit("-", 1)[-1]
+        if suffix.isdigit():
+            numbers.append(int(suffix))
+    task_no = f"LABE-{max(numbers, default=0) + 1:04d}"
+    task = {
+        "id": max((int(row.get("id", 0)) for row in label_rows), default=0) + 1,
+        "status": "标注中",
+        "pending": True,
+        "abnormal": False,
+        "任务编号": task_no,
+        "样本范围": f"样本{strategy_no}",
+        "标注类型": "样本分层派发",
+        "标注规范": "继承分层策略",
+        "派发人数": "1",
+        "截止日期": datetime.date.today().isoformat(),
+        "完成进度": "0%",
+        "派发时间": datetime.datetime.now().isoformat(),
+        "原策略编号": strategy_no,
+        "触发策略": strategy_no,
+        "样本数量": sample_count,
+        "有效样本数量": sample_count,
+        "触发策略id": strategy_no,
+        "triggered_by": f"sample_strata/{strategy_no}",
+    }
+    label_rows.append(task)
+    effects.append(FlowEffect(
+        "派发任务", "label_task", int(task["id"]),
+        f"样本 {strategy_no}({sample_count}条) 出样后新增派发标注任务 {task_no}",
+    ))
+    return task
 
 
 def _label_review_pass(label_task: dict[str, Any], effects: list[FlowEffect]):
-    """标注审核通过。"""
+    """标注审核通过：审核数量沿用派发任务的有效样本数量。"""
     task_no = str(label_task.get("任务编号", ""))
+    total = parse_sample_count(label_task.get("有效样本数量"))[0] or 0
+    rejected = 1 if total > 1 else 0
+    passed = total - rejected
     review_rows = store.rows("label_review")
     for rrow in review_rows:
         if rrow.get("status") == "待审核":
             rrow["status"] = "已通过"
             rrow["pending"] = False
             rrow["标注任务"] = task_no
-            rrow["样本数量"] = 30
-            rrow["通过数量"] = 29
-            rrow["驳回数量"] = 1
-            rrow["一致率"] = "96.7%"
+            rrow["样本数量"] = total
+            rrow["通过数量"] = passed
+            rrow["驳回数量"] = rejected
+            rrow["一致率"] = f"{passed / total * 100:.1f}%" if total else "—"
             rrow["审核时间"] = datetime.datetime.now().isoformat()
             rrow["triggered_by"] = f"label_task/{task_no}"
             effects.append(FlowEffect(
@@ -638,6 +770,32 @@ for link in FLOW_LINKS:
     if parts:
         origin = parts[0]  # e.g. "feature_reg/审核注册"
         FLOW_TRIGGERS.setdefault(origin, []).append(trigger)
+
+
+def _sample_strata_trace(sample_strata_id: int) -> list[FlowEffect]:
+    """只读的样本分层联动轨迹：查询不能触发派发或改变状态。"""
+    ss = store.find("sample_strata", sample_strata_id)
+    if ss is None:
+        return []
+    effects = _replay_effects(ss) if ss.get("派发已接受") else []
+    detail = ss.get("当前校验明细")
+    if detail is None:
+        normalized, reason = parse_sample_count(ss.get("样本数量"))
+        state = "可派发" if normalized is not None else "暂无可用数量"
+        note = reason or "样本数量校验通过，可派发"
+        detail = {"校验状态": state, "原因": note, "可派发": normalized is not None}
+    effects.append(FlowEffect(
+        "出样校验", "sample_strata", int(ss.get("id", 0)),
+        f"样本数量 {detail.get('样本数量原值', ss.get('样本数量'))!r}："
+        f"{detail.get('校验状态')}，{detail.get('原因')}",
+    ))
+    return effects
+
+
+# 只读轨迹读取器：避免“查看联动轨迹”本身触发下游派发。
+FLOW_TRACE_READERS: dict[str, Callable[[int], list[FlowEffect]]] = {
+    "sample_strata": _sample_strata_trace,
+}
 
 
 # ---------------------------------------------------------------------------

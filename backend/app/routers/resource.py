@@ -10,7 +10,8 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
-from app.services.data_flow import FlowEffect, FLOW_TRIGGERS, flow_engine
+from app.services.data_flow import FLOW_TRACE_READERS, FLOW_TRIGGERS, flow_engine
+from app.services.sample_count import dispatchable_details
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -20,6 +21,13 @@ def require_service(module: str):
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     return service
+
+
+@router.get("/sample_strata/dispatch-list")
+def sample_dispatch_list() -> dict[str, Any]:
+    """派发清单：只消费出样校验明细中“可派发”的有效范围。"""
+    items = dispatchable_details()
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/{module}", response_model=PageResult[dict])
@@ -94,24 +102,40 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 
 @router.get("/{module}/{entry_id}/flow-trace")
 def get_flow_trace(module: str, entry_id: int):
-    """查看某个 entry 参与的跨模块数据流副作用。"""
-    require_service(module)
+    """查看某个 entry 参与的跨模块数据流副作用。
+
+    只读：不得因为查看轨迹而触发下游派发。样本分层走只读轨迹读取器，
+    其余模块的链路函数同样必须保证只消费已达标状态。
+    """
+    service = require_service(module)
+    if service.get_entry(entry_id) is None:
+        raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
     effects: list[dict] = []
-    for key, triggers in FLOW_TRIGGERS.items():
-        if key.startswith(f"{module}/"):
-            for fn in triggers:
-                eff = fn(entry_id)
-                effects.extend([{"name": e.name, "module": e.module, "entry_id": e.entry_id,
-                                 "description": e.description, "timestamp": e.timestamp}
-                                for e in eff])
+    reader = FLOW_TRACE_READERS.get(module)
+    if reader is not None:
+        produced = reader(entry_id)
+    else:
+        produced = []
+        for key, triggers in FLOW_TRIGGERS.items():
+            if key.startswith(f"{module}/"):
+                for fn in triggers:
+                    produced.extend(fn(entry_id))
+    effects.extend([{"name": e.name, "module": e.module, "entry_id": e.entry_id,
+                     "description": e.description, "timestamp": e.timestamp}
+                    for e in produced])
     return {"module": module, "entry_id": entry_id, "effects": effects}
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)
 def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResult:
     service = require_service(module)
-    entry, message = service.run_action(entry_id, payload.action.strip())
-    # 动作执行后触发跨模块数据流
-    flow_result = flow_engine.on_action(module, payload.action.strip(), entry_id)
-    return ActionResult(ok=entry is not None, message=message, entry=entry,
-                        flow=flow_result if flow_result["hits"] > 0 else None)
+    action = payload.action.strip()
+    entry, message = service.run_action(entry_id, action, payload.values)
+    # 只有动作真正执行成功才触发跨模块数据流，避免无效动作消耗下游任务。
+    flow_result = flow_engine.on_action(module, action, entry_id) if entry is not None else None
+    return ActionResult(
+        ok=entry is not None,
+        message=message,
+        entry=entry,
+        flow=flow_result if flow_result and flow_result["hits"] > 0 else None,
+    )

@@ -1,6 +1,13 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  DispatchItem,
+  EntryRow,
+  FlowEffect,
+  OverviewResult,
+  PageResult,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -29,12 +36,27 @@ export async function runAction(
   key: string,
   id: number,
   action: string,
+  values: Record<string, string> = {},
 ): Promise<ActionResult> {
   const response = await request(`/api/${key}/${id}/actions`, {
     method: 'POST',
-    body: JSON.stringify({ action }),
+    body: JSON.stringify({ action, values }),
   })
   return await response.json()
+}
+
+export async function fetchDispatchList(): Promise<DispatchItem[]> {
+  const response = await request('/api/sample_strata/dispatch-list')
+  if (!response.ok) throw new Error('派发清单读取失败')
+  const payload = (await response.json()) as { items: DispatchItem[] }
+  return payload.items
+}
+
+export async function fetchFlowTrace(key: string, id: number): Promise<FlowEffect[]> {
+  const response = await request(`/api/${key}/${id}/flow-trace`)
+  if (!response.ok) throw new Error('联动轨迹读取失败')
+  const payload = (await response.json()) as { effects: FlowEffect[] }
+  return payload.effects
 }
 
 export async function downloadEntries(

@@ -56,10 +56,19 @@ class BaseModuleService:
         entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
+        self.after_create(entry, values)
         rows.append(entry)
         return entry, []
 
-    def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
+    def after_create(self, entry: dict[str, Any], values: dict[str, Any]) -> None:
+        """登记后的领域补充（例如初始化校验明细）。"""
+
+    def run_action(
+        self,
+        entry_id: int,
+        action: str,
+        values: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
